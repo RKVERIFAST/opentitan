@@ -33,6 +33,25 @@ config_setting(
 )
 
 cc_library(
+    name = "tdes",
+    srcs = ["tdes.c"],
+    hdrs = ["//sw/device/lib/crypto/include:tdes.h"],
+    deps = [
+        ":cmvp",
+        ":config",
+        ":integrity",
+        ":keyblob",
+        ":state",
+        ":status",
+        "//sw/device/lib/base:hardened",
+        "//sw/device/lib/base:hardened_memory",
+        "//sw/device/lib/base:math",
+        "//sw/device/lib/base:memory",
+        "//sw/device/lib/crypto/include:datatypes",
+    ],
+)
+
+cc_library(
     name = "aes",
     srcs = ["aes.c"],
     hdrs = ["//sw/device/lib/crypto/include:aes.h"],
@@ -419,6 +438,7 @@ cc_test(
         "//hw/top:keymgr_dpe_c_regs",
         "//hw/top:top_lib",
         "//sw/device/lib/base:abs_mmio",
+        "//sw/device/lib/crypto/impl/aes_kwp",
         "@googletest//:gtest_main",
     ],
 )

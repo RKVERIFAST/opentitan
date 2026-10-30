@@ -65,6 +65,11 @@ volatile otcrypto_interface_t otcrypto = {
     .aes = &otcrypto_aes,
     .aes_padded_plaintext_length = &otcrypto_aes_padded_plaintext_length,
 
+    // TDES
+    .tdes = &otcrypto_tdes,
+    .tdes_padded_plaintext_length = &otcrypto_tdes_padded_plaintext_length,
+    .tdes_padding_strip = &otcrypto_tdes_padding_strip,
+
     // AES-GCM (one-shot).
     .aes_gcm_encrypt = &otcrypto_aes_gcm_encrypt,
     .aes_gcm_decrypt = &otcrypto_aes_gcm_decrypt,
@@ -148,6 +153,7 @@ volatile otcrypto_interface_t otcrypto = {
     .ed25519_sign = &otcrypto_ed25519_sign,
     .ed25519_sign_verify = &otcrypto_ed25519_sign_verify,
     .ed25519_verify = &otcrypto_ed25519_verify,
+    .ed25519_point_on_curve = &otcrypto_ed25519_point_on_curve,
 
     // Ed25519 (async).
     .ed25519_keygen_async_start = &otcrypto_ed25519_keygen_async_start,

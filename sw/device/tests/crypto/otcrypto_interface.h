@@ -92,6 +92,17 @@ typedef struct otcrypto_interface_t {
                                                    otcrypto_aes_padding_t,
                                                    size_t *);
 
+  // TDES
+  otcrypto_status_t (*tdes)(otcrypto_blinded_key_t *, otcrypto_word32_buf_t *,
+                            otcrypto_tdes_mode_t, otcrypto_tdes_operation_t,
+                            const otcrypto_const_byte_buf_t *,
+                            otcrypto_tdes_padding_t, otcrypto_byte_buf_t *);
+  otcrypto_status_t (*tdes_padded_plaintext_length)(size_t,
+                                                    otcrypto_tdes_padding_t,
+                                                    size_t *);
+  otcrypto_status_t (*tdes_padding_strip)(otcrypto_byte_buf_t *,
+                                          otcrypto_tdes_padding_t, size_t *);
+
   // AES-GCM
   otcrypto_status_t (*aes_gcm_encrypt)(otcrypto_blinded_key_t *,
                                        const otcrypto_const_byte_buf_t *,
@@ -245,6 +256,8 @@ typedef struct otcrypto_interface_t {
                                       otcrypto_eddsa_sign_mode_t,
                                       const otcrypto_const_word32_buf_t *,
                                       hardened_bool_t *);
+  otcrypto_status_t (*ed25519_point_on_curve)(const otcrypto_unblinded_key_t *,
+                                              hardened_bool_t *);
   otcrypto_status_t (*ed25519_keygen_async_start)(otcrypto_blinded_key_t *);
   otcrypto_status_t (*ed25519_keygen_async_finalize)(
       otcrypto_blinded_key_t *, otcrypto_unblinded_key_t *);

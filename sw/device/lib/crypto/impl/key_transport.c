@@ -75,9 +75,12 @@ otcrypto_status_t otcrypto_hw_backed_key(uint32_t version,
                                          const uint32_t salt[7],
                                          otcrypto_blinded_key_t *key) {
   OTCRYPTO_LOCKED_STATE_CHECK();
-  if (key == NULL || key->keyblob == NULL) {
+#ifndef OTCRYPTO_DISABLE_NULL_CHECKS
+  if (key == NULL || key->keyblob == NULL || salt == NULL) {
+    // COVERAGE (MISSING) We do not cover null inputs
     return OTCRYPTO_BAD_ARGS;
   }
+#endif
   if ((key->keyblob_length != kKeyblobHwBackedBytes &&
        key->keyblob_length != kSwKeyblobHwBackedBytes) ||
       key->config.hw_backed != kHardenedBoolTrue) {
@@ -106,13 +109,24 @@ otcrypto_status_t otcrypto_hw_backed_key(uint32_t version,
 otcrypto_status_t otcrypto_hw_backed_attestation_key(
     uint32_t version, const uint32_t salt[8], otcrypto_blinded_key_t *key) {
   OTCRYPTO_LOCKED_STATE_CHECK();
-  if (key == NULL || key->keyblob == NULL) {
+#ifndef OTCRYPTO_DISABLE_NULL_CHECKS
+  if (key == NULL || key->keyblob == NULL || salt == NULL) {
+    // COVERAGE (MISSING) We do not cover null inputs
     return OTCRYPTO_BAD_ARGS;
   }
+#endif
 
   if ((key->keyblob_length != kCdiKeyblobHwBackedBytes &&
        key->keyblob_length != kSwKeyblobHwBackedBytes) ||
       key->config.hw_backed != kHardenedBoolTrue) {
+    return OTCRYPTO_BAD_ARGS;
+  }
+
+  // Get the key type from the top 16 bits of the full mode and ensure that it
+  // is not RSA. All other key types are acceptable for hardware-backed keys.
+  otcrypto_key_type_t key_type =
+      (otcrypto_key_type_t)(key->config.key_mode >> 16);
+  if (key_type == kOtcryptoKeyTypeRsa) {
     return OTCRYPTO_BAD_ARGS;
   }
 
@@ -123,14 +137,20 @@ otcrypto_status_t otcrypto_hw_backed_attestation_key(
   // Set the checksum.
   key->checksum = otcrypto_integrity_blinded_checksum(key);
 
-  return OTCRYPTO_OK;
+  return otcrypto_eval_exit(OTCRYPTO_OK);
 }
 
 otcrypto_status_t ot_crypto_hw_backed_keygen(hardened_bool_t attestation,
                                              otcrypto_blinded_key_t *key) {
   OTCRYPTO_SET_CMVP_INDICATOR(OTCRYPTO_FUNCTION_HW_BACKED_KEYGEN);
   OTCRYPTO_LOCKED_STATE_CHECK();
+#ifndef OTCRYPTO_DISABLE_NULL_CHECKS
   if (key == NULL || key->keyblob == NULL) {
+    return OTCRYPTO_BAD_ARGS;
+  }
+#endif
+
+  if (otcrypto_integrity_blinded_key_check(key) != kHardenedBoolTrue) {
     return OTCRYPTO_BAD_ARGS;
   }
 
@@ -184,6 +204,12 @@ otcrypto_status_t ot_crypto_hw_backed_keygen(hardened_bool_t attestation,
 otcrypto_status_t otcrypto_wrapped_key_len(const otcrypto_key_config_t config,
                                            size_t *wrapped_num_words) {
   OTCRYPTO_LOCKED_STATE_CHECK();
+#ifndef OTCRYPTO_DISABLE_NULL_CHECKS
+  if (wrapped_num_words == NULL) {
+    // COVERAGE (MISSING) We do not cover null inputs
+    return OTCRYPTO_BAD_ARGS;
+  }
+#endif
   // Check that the total wrapped key length will fit in 32 bits.
   size_t config_num_words = sizeof(otcrypto_key_config_t) / sizeof(uint32_t);
   if (keyblob_num_words(config) > UINT32_MAX - config_num_words - 2) {
@@ -210,7 +236,7 @@ otcrypto_status_t otcrypto_wrapped_key_len(const otcrypto_key_config_t config,
     *wrapped_num_words += 1;
   }
 
-  return otcrypto_eval_exit(OTCRYPTO_OK);
+  return OTCRYPTO_OK;
 }
 
 /**
@@ -241,6 +267,10 @@ static status_t aes_kwp_key_construct(const otcrypto_blinded_key_t *key_kek,
   // Set the mode of the underlying AES key to ECB (since this is the
   // underlying block cipher mode for KWP).
   aes_key->mode = kAesCipherModeEcb;
+  aes_key->sideload = key_kek->config.hw_backed;
+  aes_key->key_len = keyblob_share_num_words(key_kek->config);
+
+  aes_key->keymgr_dpe_slot_idx = key_kek->config.keymgr_dpe_slot_idx;
 
   if (key_kek->config.hw_backed == kHardenedBoolTrue) {
     // Call keymgr dpe to sideload the key into AES.
@@ -248,21 +278,18 @@ static status_t aes_kwp_key_construct(const otcrypto_blinded_key_t *key_kek,
     HARDENED_TRY(
         keyblob_to_keymgr_dpe_diversification(key_kek, &diversification));
     HARDENED_TRY(keymgr_dpe_generate_key_aes(diversification));
-  } else if (key_kek->config.hw_backed != kHardenedBoolFalse) {
+    aes_key->key_shares[0] = NULL;
+    aes_key->key_shares[1] = NULL;
+  } else if (key_kek->config.hw_backed == kHardenedBoolFalse) {
+    // Get pointers to the individual shares.
+    uint32_t *share0;
+    uint32_t *share1;
+    HARDENED_TRY(keyblob_to_shares(key_kek, &share0, &share1));
+    aes_key->key_shares[0] = share0;
+    aes_key->key_shares[1] = share1;
+  } else {
     return OTCRYPTO_BAD_ARGS;
   }
-  aes_key->sideload = key_kek->config.hw_backed;
-  aes_key->keymgr_dpe_slot_idx = key_kek->config.keymgr_dpe_slot_idx;
-
-  // Set the AES key length (in words).
-  aes_key->key_len = keyblob_share_num_words(key_kek->config);
-
-  // Get pointers to the individual shares.
-  uint32_t *share0;
-  uint32_t *share1;
-  HARDENED_TRY(keyblob_to_shares(key_kek, &share0, &share1));
-  aes_key->key_shares[0] = share0;
-  aes_key->key_shares[1] = share1;
 
   // Create the checksum of the key and store it in the key structure.
   aes_key->checksum = aes_key_integrity_checksum(aes_key);
@@ -393,9 +420,10 @@ otcrypto_status_t otcrypto_key_unwrap(
   // Unwrap the key.
   uint32_t plaintext[wrapped_key->len];
   HARDENED_TRY(hardened_memshred(plaintext, ARRAYSIZE(plaintext)));
+  size_t plaintext_len;
   HARDENED_TRY(aes_kwp_unwrap(kek, wrapped_key->data,
                               wrapped_key->len * sizeof(uint32_t), success,
-                              plaintext));
+                              plaintext, &plaintext_len));
 
   if (launder32(*success) != kHardenedBoolTrue) {
     *success = kHardenedBoolFalse;
@@ -418,9 +446,11 @@ otcrypto_status_t otcrypto_key_unwrap(
   HARDENED_TRY(
       otcrypto_wrapped_key_len(unwrapped_key->config, &exp_wrapped_len));
   if (keyblob_words != keyblob_num_words(unwrapped_key->config) ||
-      wrapped_key->len != exp_wrapped_len) {
+      wrapped_key->len != exp_wrapped_len ||
+      plaintext_len != (config_words + 2 + keyblob_words) * sizeof(uint32_t)) {
     // COVERAGE (SW ERR) A valid wrapped key generated by otcrypto_key_wrap
-    // always has a matching keyblob_words field and wrapped length.
+    // always has a matching keyblob_words field, wrapped length, and
+    // authenticated plaintext length.
     HARDENED_TRY(hardened_memshred(plaintext, ARRAYSIZE(plaintext)));
     return otcrypto_eval_exit(OTCRYPTO_OK);
   }
@@ -445,10 +475,14 @@ otcrypto_status_t otcrypto_import_blinded_key(
     const otcrypto_const_word32_buf_t *key_share1,
     otcrypto_blinded_key_t *blinded_key) {
   OTCRYPTO_LOCKED_STATE_CHECK();
+#ifndef OTCRYPTO_DISABLE_NULL_CHECKS
   if (blinded_key == NULL || blinded_key->keyblob == NULL ||
-      key_share0->data == NULL || key_share1->data == NULL) {
+      key_share0 == NULL || key_share0->data == NULL || key_share1 == NULL ||
+      key_share1->data == NULL) {
+    // COVERAGE (MISSING) We do not cover null inputs
     return OTCRYPTO_BAD_ARGS;
   }
+#endif
 
   // Ensure the key is symmetric and not hardware-backed.
   HARDENED_TRY(keyblob_ensure_xor_masked(blinded_key->config));
@@ -484,10 +518,13 @@ otcrypto_status_t otcrypto_export_blinded_key(
     const otcrypto_blinded_key_t *blinded_key,
     otcrypto_word32_buf_t *key_share0, otcrypto_word32_buf_t *key_share1) {
   OTCRYPTO_LOCKED_STATE_CHECK();
-  if (blinded_key->keyblob == NULL || key_share0->data == NULL ||
+#ifndef OTCRYPTO_DISABLE_NULL_CHECKS
+  if (blinded_key == NULL || blinded_key->keyblob == NULL ||
+      key_share0 == NULL || key_share0->data == NULL || key_share1 == NULL ||
       key_share1->data == NULL) {
     return OTCRYPTO_BAD_ARGS;
   }
+#endif
 
   // Check key integrity.
   if (launder32(otcrypto_integrity_blinded_key_check(blinded_key)) !=
