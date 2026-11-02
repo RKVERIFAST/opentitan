@@ -147,6 +147,25 @@ cc_library(
 )
 
 cc_library(
+    name = "cmac_kdf",
+    srcs = ["cmac_kdf.c"],
+    hdrs = ["//sw/device/lib/crypto/include:cmac_kdf.h"],
+    deps = [
+        ":cmac",
+        ":cmvp",
+        ":config",
+        ":integrity",
+        ":keyblob",
+        ":state",
+        ":status",
+        "//sw/device/lib/base:hardened_memory",
+        "//sw/device/lib/base:math",
+        "//sw/device/lib/crypto/drivers:aes",
+        "//sw/device/lib/crypto/include:datatypes",
+    ],
+)
+
+cc_library(
     name = "ecc_curve25519",
     srcs = ["ecc_curve25519.c"],
     hdrs = ["//sw/device/lib/crypto/include:ecc_curve25519.h"],
@@ -603,6 +622,27 @@ cc_library(
         ":sha3",
         ":status",
         "//sw/device/lib/base:hardened",
+        "//sw/device/lib/crypto/include:datatypes",
+    ],
+)
+
+cc_library(
+    name = "sha1",
+    srcs = ["sha1.c"],
+    hdrs = [
+        "//sw/device/lib/crypto/include:sha1.h",
+    ],
+    deps = [
+        ":cmvp",
+        ":config",
+        ":integrity",
+        ":keyblob",
+        ":state",
+        ":status",
+        "//sw/device/lib/base:hardened",
+        "//sw/device/lib/base:hardened_memory",
+        "//sw/device/lib/base:macros",
+        "//sw/device/lib/base:math",
         "//sw/device/lib/crypto/include:datatypes",
     ],
 )
