@@ -36,7 +36,6 @@
 
 .text
 .globl rsa_keygen
-.globl rsa_keygen_det
 .globl gen_d
 
 # Exposed for testing only.
@@ -52,7 +51,14 @@
  * @param[out] dmem[rsa_d0]: rsa_d0, first share of secret exponent
  * @param[out] dmem[rsa_d1]: rsa_d1, second share of secret exponent
  */
+.equ HARDENED_BOOL_TRUE, 0x739
+
 rsa_keygen:
+  la   x16, rsa_e
+  lw   x2, 0(x16)
+  addi x3, x0, HARDENED_BOOL_TRUE
+  beq  x2, x3, _det_keygen
+
   # Temporarily store the limb count in DMEM.
   la x16, nlimbs_tmp
   sw x30, 0(x16)
@@ -69,7 +75,6 @@ _rsa_keygen_restart:
   jal x1, gen_p
   jal x1, gen_q
 
-_gen_g_h_d:
   # Generate the 512-bit auxiliary primes.
   # dmem[rsa_g] <= g.
   # dmem[rsa_h] <= h.
@@ -156,12 +161,12 @@ gen_d:
   # dmem[rsa_h] <= (q - 1) * h
   la  x10, rsa_q
   la  x11, rsa_h
-  la  x12, work_buf
+  la  x12, work_buf_kgen
   li  x31, 2
   jal x1, bignum_mul
 
   # Check that gcd(h * (q - 1), F4) == 1.
-  la x16, work_buf
+  la x16, work_buf_kgen
   addi x31, x30, 2
   jal x1, mod_f4
 
@@ -172,9 +177,9 @@ gen_d:
 
   # Compute gcd(g * (p - 1), h * (q - 1)).
   # dmem[RR] <= 0.
-  # dmem[work_buf] <= gcd(g * (p - 1), h * (q - 1)).
+  # dmem[work_buf_kgen] <= gcd(g * (p - 1), h * (q - 1)).
   la   x10, RR
-  la   x11, work_buf
+  la   x11, work_buf_kgen
   addi x30, x30, 2
   jal  x1, gcd
 
@@ -186,7 +191,7 @@ gen_d:
   li x9, 3
 
   # Check that gcd(g * (p - 1), h * (q - 1)) > 0.
-  la     x10, work_buf
+  la     x10, work_buf_kgen
   bn.lid x8, 0(x10++)
   bn.cmp w2, w31
   csrrs  x2, FG0, x0
@@ -213,7 +218,7 @@ _remove_even_factors:
 
   # Extract the LSB of gcd(p - 1, q - 1).
   # x2 <= gcd(p - 1, q - 1) & 1.
-  la   x10, work_buf # (p - 1) * (q - 1)
+  la   x10, work_buf_kgen # (p - 1) * (q - 1)
   la   x11, r0       # gcd(p - 1, q - 1)
   lw   x2, 0(x10)
   andi x2, x2, 1
@@ -221,13 +226,13 @@ _remove_even_factors:
   bne x2, x0, _remove_even_factors_end
 
   # The MSB is zero, shift the denominator by one position to right.
-  # dmem[work_buf] <= gcd(p - 1, q - 1) >> 1.
+  # dmem[work_buf_kgen] <= gcd(p - 1, q - 1) >> 1.
   bn.lid  x8, 0(x10)
   bn.rshi w2, w31, w2 >> 1
   bn.sid  x8, 0(x10)
 
   # Shift the numerator by one position to the right.
-  # dmem[work_buf] <= (p - 1) * (q - 1) >> 1.
+  # dmem[work_buf_kgen] <= (p - 1) * (q - 1) >> 1.
   addi x31, x30, -1
   addi x12, x11, 32
   loop x31, 4
@@ -248,7 +253,7 @@ _remove_even_factors_end:
   # Calculate gcd(p - 1, q - 1)^-1 mod 2^256.
   # w21 <= gcd(p - 1, q - 1)^-1 mod 2^256.
   li x8, 20
-  la x10, work_buf
+  la x10, work_buf_kgen
   bn.lid x8, 0(x10)
   jal x1, nr_inv
 
@@ -258,9 +263,10 @@ _remove_even_factors_end:
   jal x1, div_word
 
   # Calculate the secret key d = e^-1 mod LCM(p - 1, q - 1).
+  # Uses contiguous rsa_d (rsa_d0 || rsa_d1) for the (n + 1)-limb intermediate.
   # dmem[d0] <= d.
   la x24, r0
-  la x25, rsa_d0
+  la x25, rsa_d
   la x26, r1
   addi x27, x30, 0
   jal x1, modinv_f4
@@ -434,7 +440,6 @@ _gen_q_body_inner:
   jal x1, distance_test
   beq x2, x0, _gen_q_body_inner
 
-_gen_q_check:
   jal x1, fermat_test
   beq x2, x0, _gen_q_loop
 
@@ -669,33 +674,20 @@ mul256_w24xw25:
   ret
   unimp
 
-/**
- * Deterministic RSA prime step and key generation.
- *
- * Expects raw random candidate words in `dmem[rsa_n]` and `dmem[rsa_p]`
- * zeroed before the first call. Checks one candidate per call: first for `p`
- * (`dmem[rsa_p] == 0`), then for `q` (`dmem[rsa_p] != 0`), and once `q` is
- * found, generates auxiliary primes `g`, `h` and private exponent `d`.
- *
- * @param[in] x30: n, number of limbs in the modulus and key.
- */
-rsa_keygen_det:
-  la x16, nlimbs_tmp
-  sw x30, 0(x16)
-  srl x30, x30, 1
-  li x26, 0
-  la x16, rsa_n
-  jal x1, fix_prime_candidate
-  la x16, rsa_p
-  lw x2, 0(x16)
-  bne x2, x0, _det_gen_q
-  jal x1, _gen_p_check
-  jal x0, _rsa_keygen_fail
-_det_gen_q:
-  jal x1, distance_test
-  beq x2, x0, _rsa_keygen_fail
-  jal x1, _gen_q_check
-  jal x0, _gen_g_h_d
+_det_keygen:
+  srl  x30, x30, 1
+  la   x16, rsa_p
+  lw   x2, 0(x16)
+  bne  x2, x0, _det_mul_pq
+  li   x26, 0
+  jal  x0, _gen_p_check
+
+_det_mul_pq:
+  la   x10, rsa_p
+  la   x11, rsa_q
+  la   x12, rsa_n
+  addi x31, x30, 0
+  jal  x0, bignum_mul
 
 _rsa_keygen_fail:
   la x16, mode
