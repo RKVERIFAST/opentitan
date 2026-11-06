@@ -1,3 +1,6 @@
+# Registers
+
+<!-- BEGIN CMDGEN util/regtool.py -d ./hw/ip/rram_ctrl/data/rram_ctrl.hjson -->
 ## Summary
 
 | Name                                                                             | Offset   |   Length | Description                                                                                                                                                    |
@@ -706,7 +709,7 @@ Region register write enable. Once set to 0, it can no longer be configured to 1
 Base and size configuration for an emulated info page region (window).
 Unlike [`MP_REGION`](#mp_region), this register carries no access permissions of its own.
 See [`EMUL_INFO_SUBREGION_CFG`](#emul_info_subregion_cfg) for per-subregion permissions.
-Host access to this window through host_tl is always blocked in hardware.
+Once EN is set, host access to this window through host_tl is always blocked in hardware.
 Software can access it through the controller (core_tl and the FIFOs) if allowed by the subregion configuration.
 Once EN is set, any access to the window that is not covered by an enabled subregion is denied.
 Enabling this and locking it via [`EMUL_INFO_REGWEN`](#emul_info_regwen) is a precondition for using any subregions configured through [`EMUL_INFO_SUBREGION`](#emul_info_subregion) and [`EMUL_INFO_SUBREGION_CFG`](#emul_info_subregion_cfg) within this window.
@@ -1430,3 +1433,6 @@ The FIFO is 16 entries of 4B words.
 - Size (words): `1`
 - Access: `ro`
 - Byte writes are *not* supported.
+
+
+<!-- END CMDGEN -->
