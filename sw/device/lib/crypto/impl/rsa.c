@@ -162,6 +162,12 @@ static status_t rsa_mode_check(const otcrypto_key_mode_t mode) {
     case kOtcryptoKeyModeRsaEncryptOaep:
       HARDENED_CHECK_EQ(mode, kOtcryptoKeyModeRsaEncryptOaep);
       return OTCRYPTO_OK;
+    case kOtcryptoKeyModeRsaEncryptPkcs:
+      HARDENED_CHECK_EQ(mode, kOtcryptoKeyModeRsaEncryptPkcs);
+      return OTCRYPTO_OK;
+    case kOtcryptoKeyModeRsaRaw:
+      HARDENED_CHECK_EQ(mode, kOtcryptoKeyModeRsaRaw);
+      return OTCRYPTO_OK;
     default:
       return OTCRYPTO_BAD_ARGS;
   }
@@ -200,6 +206,7 @@ static hardened_bool_t bignum_lt(const uint32_t *a, const uint32_t *b,
 otcrypto_status_t otcrypto_rsa_public_key_construct(
     otcrypto_rsa_size_t size, const otcrypto_const_word32_buf_t *modulus,
     otcrypto_unblinded_key_t *public_key) {
+  OTCRYPTO_SET_CMVP_INDICATOR(OTCRYPTO_FUNCTION_RSA_PUBLIC_KEY_CONSTRUCT);
   OTCRYPTO_LOCKED_STATE_CHECK();
 #ifndef OTCRYPTO_DISABLE_NULL_CHECKS
   if (modulus == NULL || modulus->data == NULL || public_key == NULL ||
@@ -341,6 +348,135 @@ static status_t public_key_structural_check(
   return rsa_mode_check(public_key->key_mode);
 }
 
+/**
+ * The 132 odd primes smaller than 752.
+ *
+ * Used to check that an RSA modulus has no prime factors smaller than 752, as
+ * required by NIST SP 800-89, Section 5.3.3.
+ */
+static const uint16_t kRsaSmallOddPrimes[] = {
+    3,   5,   7,   11,  13,  17,  19,  23,  29,  31,  37,  41,  43,  47,  53,
+    59,  61,  67,  71,  73,  79,  83,  89,  97,  101, 103, 107, 109, 113, 127,
+    131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199,
+    211, 223, 227, 229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283,
+    293, 307, 311, 313, 317, 331, 337, 347, 349, 353, 359, 367, 373, 379, 383,
+    389, 397, 401, 409, 419, 421, 431, 433, 439, 443, 449, 457, 461, 463, 467,
+    479, 487, 491, 499, 503, 509, 521, 523, 541, 547, 557, 563, 569, 571, 577,
+    587, 593, 599, 601, 607, 613, 617, 619, 631, 641, 643, 647, 653, 659, 661,
+    673, 677, 683, 691, 701, 709, 719, 727, 733, 739, 743, 751,
+};
+static_assert(ARRAYSIZE(kRsaSmallOddPrimes) == 132,
+              "Unexpected number of odd primes smaller than 752.");
+
+/**
+ * Compute a bignum modulo a small value.
+ *
+ * Processes the bignum in 16-bit halves of each word so that all intermediate
+ * values fit in 32 bits (`r < p < 2^16`), avoiding 64-bit division.
+ *
+ * This routine is not constant time; it must only be used on public values.
+ *
+ * @param a Bignum operand (little-endian 32-bit words).
+ * @param num_words Number of 32-bit words in `a`.
+ * @param p Small modulus, 1 < p < 2^16.
+ * @return a mod p.
+ */
+static uint32_t bignum_mod_small(const uint32_t *a, size_t num_words,
+                                 uint32_t p) {
+  uint32_t r = 0;
+  for (size_t i = num_words; i > 0; i--) {
+    r = ((r << 16) | (a[i - 1] >> 16)) % p;
+    r = ((r << 16) | (a[i - 1] & 0xffff)) % p;
+  }
+  return r;
+}
+
+/**
+ * Check an RSA modulus against NIST SP 800-89, Section 5.3.3.
+ *
+ * Checks that the modulus:
+ *   - is odd,
+ *   - has exactly `num_words * 32` bits (the most significant bit is set),
+ *   - has no prime factors smaller than 752.
+ *
+ * The modulus is public, so this routine does not need to be constant time.
+ *
+ * @param n RSA modulus (little-endian 32-bit words).
+ * @param num_words Number of 32-bit words in `n` (> 0).
+ * @return OK if the modulus passes the checks, OTCRYPTO_BAD_ARGS otherwise.
+ */
+static status_t rsa_modulus_check(const uint32_t *n, size_t num_words) {
+  HARDENED_CHECK_NE(num_words, 0);
+
+  // The modulus must be odd.
+  if (is_even(n[0])) {
+    return OTCRYPTO_BAD_ARGS;
+  }
+
+  // The modulus must have the full bit length for its size.
+  if ((n[num_words - 1] >> 31) != 1) {
+    return OTCRYPTO_BAD_ARGS;
+  }
+
+  // The modulus must not have any prime factors smaller than 752.
+  size_t i = 0;
+  for (; launder32(i) < ARRAYSIZE(kRsaSmallOddPrimes); i++) {
+    if (bignum_mod_small(n, num_words, kRsaSmallOddPrimes[i]) == 0) {
+      return OTCRYPTO_BAD_ARGS;
+    }
+  }
+  HARDENED_CHECK_EQ(i, ARRAYSIZE(kRsaSmallOddPrimes));
+
+  return OTCRYPTO_OK;
+}
+
+/**
+ * Validate an RSA public key according to NIST SP 800-89, Section 5.3.3.
+ *
+ * Checks the key structure and integrity, then checks the modulus with
+ * `rsa_modulus_check`. The public exponent is always F4 for the approved
+ * verification API, so it is not checked here.
+ *
+ * @param public_key Public key to validate.
+ * @return OK if the key is valid, OTCRYPTO_BAD_ARGS otherwise.
+ */
+static status_t rsa_public_key_validate(
+    const otcrypto_unblinded_key_t *public_key) {
+  HARDENED_TRY(public_key_structural_check(public_key));
+
+  // Verify the checksum before reading the modulus.
+  if (otcrypto_integrity_unblinded_key_check(public_key) != kHardenedBoolTrue) {
+    return OTCRYPTO_BAD_ARGS;
+  }
+
+  otcrypto_rsa_size_t size;
+  HARDENED_TRY(rsa_size_from_public_key(public_key, &size));
+  switch (launder32(size)) {
+    case kOtcryptoRsaSize2048: {
+      HARDENED_CHECK_EQ(size, kOtcryptoRsaSize2048);
+      rsa_2048_public_key_t *pk = (rsa_2048_public_key_t *)public_key->key;
+      return rsa_modulus_check(pk->n.data, kRsa2048NumWords);
+    }
+    case kOtcryptoRsaSize3072: {
+      HARDENED_CHECK_EQ(size, kOtcryptoRsaSize3072);
+      rsa_3072_public_key_t *pk = (rsa_3072_public_key_t *)public_key->key;
+      return rsa_modulus_check(pk->n.data, kRsa3072NumWords);
+    }
+    case kOtcryptoRsaSize4096: {
+      HARDENED_CHECK_EQ(size, kOtcryptoRsaSize4096);
+      rsa_4096_public_key_t *pk = (rsa_4096_public_key_t *)public_key->key;
+      return rsa_modulus_check(pk->n.data, kRsa4096NumWords);
+    }
+    default:
+      return OTCRYPTO_BAD_ARGS;
+  }
+
+  // Should be unreachable.
+  HARDENED_TRAP();
+  // COVERAGE (FI CM) Unreachable code, checked against fault injections.
+  return OTCRYPTO_FATAL_ERR;
+}
+
 otcrypto_status_t otcrypto_rsa_keygen_async_start(otcrypto_rsa_size_t size) {
   OTCRYPTO_SET_CMVP_INDICATOR(OTCRYPTO_FUNCTION_RSA_KEYGEN_ASYNC_START);
   OTCRYPTO_HEALTH_CHECK(kTestRsa4096SignBit);
@@ -359,6 +495,10 @@ otcrypto_status_t otcrypto_rsa_keygen_async_start(otcrypto_rsa_size_t size) {
 otcrypto_status_t otcrypto_rsa_keygen(otcrypto_rsa_size_t size,
                                       otcrypto_unblinded_key_t *public_key,
                                       otcrypto_blinded_key_t *private_key) {
+  // Default to not-approved in case of an early return; this service is
+  // approved (for 3072/4096-bit keys) and `otcrypto_rsa_keygen_async_start`
+  // sets the indicator accordingly once reached.
+  OTCRYPTO_CMVP_OVERRIDE_NOT_APPROVED();
   OTCRYPTO_LOCKED_STATE_CHECK();
 #ifndef OTCRYPTO_DISABLE_NULL_CHECKS
   if (public_key == NULL || private_key == NULL) {
@@ -453,6 +593,7 @@ otcrypto_status_t otcrypto_rsa_private_key_from_exponents(
     const otcrypto_const_word32_buf_t *d_share0,
     const otcrypto_const_word32_buf_t *d_share1,
     otcrypto_blinded_key_t *private_key) {
+  OTCRYPTO_SET_CMVP_INDICATOR(OTCRYPTO_FUNCTION_RSA_PRIVATE_KEY_FROM_EXPONENTS);
   OTCRYPTO_LOCKED_STATE_CHECK();
 #ifndef OTCRYPTO_DISABLE_NULL_CHECKS
   if (modulus == NULL || modulus->data == NULL || d_share0 == NULL ||
@@ -514,6 +655,7 @@ otcrypto_status_t otcrypto_rsa_keypair_from_cofactor(
     const otcrypto_const_word32_buf_t *cofactor_share0,
     const otcrypto_const_word32_buf_t *cofactor_share1,
     otcrypto_unblinded_key_t *public_key, otcrypto_blinded_key_t *private_key) {
+  OTCRYPTO_CMVP_OVERRIDE_NOT_APPROVED();
   OTCRYPTO_LOCKED_STATE_CHECK();
 #ifndef OTCRYPTO_DISABLE_NULL_CHECKS
   if (public_key == NULL || private_key == NULL) {
@@ -550,6 +692,11 @@ otcrypto_status_t otcrypto_rsa_sign(const otcrypto_blinded_key_t *private_key,
  * @param key_mode Mode for the RSA key.
  * @param padding_mode RSA signature padding scheme.
  */
+static otcrypto_status_t rsa_decrypt_finalize_with_mode(
+    otcrypto_key_mode_t key_mode, const otcrypto_hash_mode_t hash_mode,
+    const otcrypto_const_byte_buf_t *label, otcrypto_byte_buf_t *plaintext,
+    size_t *plaintext_bytelen);
+
 static status_t key_mode_padding_check(otcrypto_key_mode_t key_mode,
                                        otcrypto_rsa_padding_t padding_mode) {
   switch (launder32(padding_mode)) {
@@ -558,6 +705,7 @@ static status_t key_mode_padding_check(otcrypto_key_mode_t key_mode,
       if (launder32(key_mode) != kOtcryptoKeyModeRsaSignPkcs) {
         // COVERAGE (MISSING) We do not cover mismatching key_mode and
         // padding_modes.
+        OTCRYPTO_CMVP_OVERRIDE_NOT_APPROVED();
         return OTCRYPTO_BAD_ARGS;
       }
       HARDENED_CHECK_EQ(key_mode, kOtcryptoKeyModeRsaSignPkcs);
@@ -565,12 +713,22 @@ static status_t key_mode_padding_check(otcrypto_key_mode_t key_mode,
     case kOtcryptoRsaPaddingPss:
       HARDENED_CHECK_EQ(padding_mode, kOtcryptoRsaPaddingPss);
       if (launder32(key_mode) != kOtcryptoKeyModeRsaSignPss) {
+        OTCRYPTO_CMVP_OVERRIDE_NOT_APPROVED();
         return OTCRYPTO_BAD_ARGS;
       }
       HARDENED_CHECK_EQ(key_mode, kOtcryptoKeyModeRsaSignPss);
       return OTCRYPTO_OK;
+    case kOtcryptoRsaPaddingNull:
+      HARDENED_CHECK_EQ(padding_mode, kOtcryptoRsaPaddingNull);
+      if (launder32(key_mode) != kOtcryptoKeyModeRsaRaw) {
+        OTCRYPTO_CMVP_OVERRIDE_NOT_APPROVED();
+        return OTCRYPTO_BAD_ARGS;
+      }
+      HARDENED_CHECK_EQ(key_mode, kOtcryptoKeyModeRsaRaw);
+      return OTCRYPTO_OK;
     default:
       // Invalid padding mode.
+      OTCRYPTO_CMVP_OVERRIDE_NOT_APPROVED();
       return OTCRYPTO_BAD_ARGS;
   }
 
@@ -588,6 +746,7 @@ otcrypto_status_t otcrypto_rsa_verify(
     hardened_bool_t *verification_result) {
 #ifndef OTCRYPTO_DISABLE_NULL_CHECKS
   if (public_key == NULL) {
+    OTCRYPTO_CMVP_OVERRIDE_NOT_APPROVED();
     return OTCRYPTO_BAD_ARGS;
   }
 #endif
@@ -604,8 +763,10 @@ otcrypto_status_t otcrypto_rsa_hash_sign_verify(
     otcrypto_rsa_padding_t padding_mode, otcrypto_word32_buf_t *signature) {
   OTCRYPTO_SET_CMVP_INDICATOR(OTCRYPTO_FUNCTION_RSA_HASH_SIGN_VERIFY);
   OTCRYPTO_HEALTH_CHECK(kTestRsa4096SignBit);
-  if (private_key != NULL &&
-      private_key->config.key_length == kOtcryptoRsa2048PrivateKeyBytes) {
+  if ((private_key != NULL &&
+       private_key->config.key_length == kOtcryptoRsa2048PrivateKeyBytes) ||
+      hash_mode == kOtcryptoHashModeSha1 ||
+      padding_mode == kOtcryptoRsaPaddingNull) {
     OTCRYPTO_CMVP_OVERRIDE_NOT_APPROVED();
   }
   uint32_t digest_data[16];
@@ -641,6 +802,18 @@ otcrypto_status_t otcrypto_rsa_hash_verify(
     hardened_bool_t *verification_result) {
   OTCRYPTO_SET_CMVP_INDICATOR(OTCRYPTO_FUNCTION_RSA_HASH_VERIFY);
   OTCRYPTO_LOCKED_STATE_CHECK();
+  if (hash_mode == kOtcryptoHashModeSha1 ||
+      padding_mode == kOtcryptoRsaPaddingNull) {
+    OTCRYPTO_CMVP_OVERRIDE_NOT_APPROVED();
+  }
+#ifndef OTCRYPTO_DISABLE_NULL_CHECKS
+  if (public_key == NULL || public_key->key == NULL) {
+    return OTCRYPTO_BAD_ARGS;
+  }
+#endif
+  // Public key validation (NIST SP 800-89, Section 5.3.3).
+  HARDENED_TRY(rsa_public_key_validate(public_key));
+
   uint32_t digest_data[16];
   HARDENED_TRY(hardened_memshred(digest_data, ARRAYSIZE(digest_data)));
   otcrypto_hash_digest_t digest;
@@ -666,8 +839,9 @@ otcrypto_status_t otcrypto_rsa_decrypt(
     const otcrypto_const_byte_buf_t *label, otcrypto_byte_buf_t *plaintext,
     size_t *plaintext_bytelen) {
   HARDENED_TRY(otcrypto_rsa_decrypt_async_start(private_key, ciphertext));
-  return otcrypto_rsa_decrypt_async_finalize(hash_mode, label, plaintext,
-                                             plaintext_bytelen);
+  OTCRYPTO_SET_CMVP_INDICATOR(OTCRYPTO_FUNCTION_RSA_DECRYPT_ASYNC_FINALIZE);
+  return rsa_decrypt_finalize_with_mode(private_key->config.key_mode, hash_mode,
+                                        label, plaintext, plaintext_bytelen);
 }
 
 #ifdef FIPS_MODE
@@ -890,6 +1064,14 @@ static otcrypto_status_t rsa_sign_exp_async_start(
   const uint32_t *d1 = &private_key->keyblob[num_words];
   const uint32_t *n = &private_key->keyblob[2 * num_words];
   uint32_t checksum = private_key->keyblob[3 * num_words];
+  if (launder32(padding_mode) == kOtcryptoRsaPaddingNull) {
+    HARDENED_CHECK_EQ(padding_mode, kOtcryptoRsaPaddingNull);
+    if (message_digest.len != num_words ||
+        bignum_lt(message_digest.data, n, num_words) == kHardenedBoolFalse) {
+      return OTCRYPTO_BAD_ARGS;
+    }
+    HARDENED_CHECK_EQ(message_digest.len, num_words);
+  }
   HARDENED_TRY_WIPE_DMEM(rsa_signature_generate_start(
       rsa_size, d0, d1, exponent, n, checksum, message_digest,
       (rsa_signature_padding_t)padding_mode));
@@ -944,7 +1126,8 @@ static otcrypto_status_t rsa_verify_exp_async_start(
 
   // Check the caller-provided public key buffer.
   HARDENED_TRY(public_key_structural_check(public_key));
-  if (launder32(public_key->key_mode) == kOtcryptoKeyModeRsaEncryptOaep) {
+  if (launder32(public_key->key_mode) == kOtcryptoKeyModeRsaEncryptOaep ||
+      launder32(public_key->key_mode) == kOtcryptoKeyModeRsaEncryptPkcs) {
     return OTCRYPTO_BAD_ARGS;
   }
 
@@ -1035,12 +1218,6 @@ static otcrypto_status_t rsa_encrypt_exp_async_start(
     return OTCRYPTO_BAD_ARGS;
   }
 
-  // Ensure the key is intended for encryption.
-  if (launder32(public_key->key_mode) != kOtcryptoKeyModeRsaEncryptOaep) {
-    return OTCRYPTO_BAD_ARGS;
-  }
-  HARDENED_CHECK_EQ(public_key->key_mode, kOtcryptoKeyModeRsaEncryptOaep);
-
   // Infer the RSA size from the public key.
   otcrypto_rsa_size_t size;
   HARDENED_TRY(rsa_size_from_public_key(public_key, &size));
@@ -1051,9 +1228,21 @@ static otcrypto_status_t rsa_encrypt_exp_async_start(
   size_t num_words = 0;
   HARDENED_TRY(rsa_size_to_params(size, &rsa_size, &num_words));
   HARDENED_CHECK_EQ(public_key->key_length, num_words * sizeof(uint32_t));
-  HARDENED_TRY_WIPE_DMEM(
-      rsa_encrypt_start(rsa_size, exponent, public_key->key, hash_mode,
-                        message->data, message->len, label->data, label->len));
+  if (launder32(public_key->key_mode) == kOtcryptoKeyModeRsaRaw) {
+    HARDENED_CHECK_EQ(public_key->key_mode, kOtcryptoKeyModeRsaRaw);
+    uint32_t msg_words[kRsa4096NumWords];
+    if (message->len != num_words * sizeof(uint32_t)) {
+      return OTCRYPTO_BAD_ARGS;
+    }
+    memcpy(msg_words, message->data, message->len);
+    if (bignum_lt(msg_words, public_key->key, num_words) ==
+        kHardenedBoolFalse) {
+      return OTCRYPTO_BAD_ARGS;
+    }
+  }
+  HARDENED_TRY_WIPE_DMEM(rsa_encrypt_start(
+      rsa_size, exponent, public_key->key, public_key->key_mode, hash_mode,
+      message->data, message->len, label->data, label->len));
   return otcrypto_eval_exit(OTCRYPTO_OK);
 }
 
@@ -1108,13 +1297,11 @@ static otcrypto_status_t rsa_decrypt_exp_async_start(
     return OTCRYPTO_BAD_ARGS;
   }
 
-  // Ensure that the key is intended for encryption.
-  if (launder32(private_key->config.key_mode) !=
-      kOtcryptoKeyModeRsaEncryptOaep) {
+  // Ensure that the key is intended for encryption or raw RSA.
+  if (launder32(private_key->config.key_mode) == kOtcryptoKeyModeRsaSignPkcs ||
+      launder32(private_key->config.key_mode) == kOtcryptoKeyModeRsaSignPss) {
     return OTCRYPTO_BAD_ARGS;
   }
-  HARDENED_CHECK_EQ(private_key->config.key_mode,
-                    kOtcryptoKeyModeRsaEncryptOaep);
 
   // Start the decryption routine.
   rsa_size_t rsa_size = (rsa_size_t)0;
@@ -1147,11 +1334,10 @@ otcrypto_status_t otcrypto_rsa_decrypt_async_start(
   return rsa_decrypt_exp_async_start(private_key, /*exponent=*/0, ciphertext);
 }
 
-otcrypto_status_t otcrypto_rsa_decrypt_async_finalize(
-    const otcrypto_hash_mode_t hash_mode,
+static otcrypto_status_t rsa_decrypt_finalize_with_mode(
+    otcrypto_key_mode_t key_mode, const otcrypto_hash_mode_t hash_mode,
     const otcrypto_const_byte_buf_t *label, otcrypto_byte_buf_t *plaintext,
     size_t *plaintext_bytelen) {
-  OTCRYPTO_SET_CMVP_INDICATOR(OTCRYPTO_FUNCTION_RSA_DECRYPT_ASYNC_FINALIZE);
   OTCRYPTO_LOCKED_STATE_CHECK();
 #ifndef OTCRYPTO_DISABLE_NULL_CHECKS
   if (plaintext == NULL || plaintext->data == NULL || label == NULL ||
@@ -1163,8 +1349,8 @@ otcrypto_status_t otcrypto_rsa_decrypt_async_finalize(
   // Call the unified `finalize()` operation, which will infer the RSA size
   // from OTBN.
   HARDENED_TRY_WIPE_DMEM(
-      rsa_decrypt_finalize(hash_mode, label->data, label->len, plaintext->len,
-                           plaintext->data, plaintext_bytelen));
+      rsa_decrypt_finalize(key_mode, hash_mode, label->data, label->len,
+                           plaintext->len, plaintext->data, plaintext_bytelen));
 
   // Consistency check; this should never happen.
   if (launder32(*plaintext_bytelen) > plaintext->len) {
@@ -1174,6 +1360,18 @@ otcrypto_status_t otcrypto_rsa_decrypt_async_finalize(
   HARDENED_CHECK_LE(*plaintext_bytelen, plaintext->len);
 
   return otcrypto_eval_exit(OTCRYPTO_OK);
+}
+
+otcrypto_status_t otcrypto_rsa_decrypt_async_finalize(
+    const otcrypto_hash_mode_t hash_mode,
+    const otcrypto_const_byte_buf_t *label, otcrypto_byte_buf_t *plaintext,
+    size_t *plaintext_bytelen) {
+  OTCRYPTO_SET_CMVP_INDICATOR(OTCRYPTO_FUNCTION_RSA_DECRYPT_ASYNC_FINALIZE);
+  otcrypto_key_mode_t key_mode = (launder32(hash_mode) == kOtcryptoHashModeNull)
+                                     ? kOtcryptoKeyModeRsaEncryptPkcs
+                                     : kOtcryptoKeyModeRsaEncryptOaep;
+  return rsa_decrypt_finalize_with_mode(key_mode, hash_mode, label, plaintext,
+                                        plaintext_bytelen);
 }
 
 static status_t public_exponent_check(uint32_t exponent) {
@@ -1236,6 +1434,7 @@ otcrypto_status_t otcrypto_rsa_decrypt_exp(
   OTCRYPTO_SET_CMVP_INDICATOR(OTCRYPTO_FUNCTION_RSA_DECRYPT_EXP);
   HARDENED_TRY(public_exponent_check(exponent));
   HARDENED_TRY(rsa_decrypt_exp_async_start(private_key, exponent, ciphertext));
-  return otcrypto_eval_exit(otcrypto_rsa_decrypt_async_finalize(
-      hash_mode, label, plaintext, plaintext_bytelen));
+  return otcrypto_eval_exit(
+      rsa_decrypt_finalize_with_mode(private_key->config.key_mode, hash_mode,
+                                     label, plaintext, plaintext_bytelen));
 }

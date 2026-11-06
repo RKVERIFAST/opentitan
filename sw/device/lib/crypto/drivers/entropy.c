@@ -62,6 +62,11 @@ enum {
   kEntropyPollCmdDoneTimeout = 1000000,
   // Timeout for waiting for GenBits to become valid
   kEntropyPollGenBitsTimeout = 131071,
+
+  /**
+   * Sparse FSM encoding for MainSmIdle in csrng_pkg.sv.
+   */
+  kCsrngMainSmStateIdle = 0x37,
 };
 
 /**
@@ -366,12 +371,12 @@ static const entropy_complex_config_t
                     .alert_threshold = 4,
                     .repcnt_threshold = 81,
                     .repcnts_threshold = 21,
-                    .adaptp_hi_threshold = 1592,
-                    .adaptp_lo_threshold = 2048 - 1592,  // 456
+                    .adaptp_hi_threshold = 1591,
+                    .adaptp_lo_threshold = 2048 - 1591,  // 457
                     .adaptps_threshold = 201,
-                    .bucket_threshold = 202,
-                    .markov_hi_threshold = 825,
-                    .markov_lo_threshold = 1024 - 825,  // 199
+                    .bucket_threshold = 201,
+                    .markov_hi_threshold = 824,
+                    .markov_lo_threshold = 1024 - 824,  // 200
                     .extht_hi_threshold = 0xffff,
                     .extht_lo_threshold = 0x0,
                 },
@@ -779,8 +784,8 @@ static void entropy_src_stop(void) {
   abs_mmio_write32(entropy_src_base() + ENTROPY_SRC_MODULE_ENABLE_REG_OFFSET,
                    ENTROPY_SRC_MODULE_ENABLE_REG_RESVAL);
 
-  // Wait for the entropy_src state machine to become idle before writing
-  // REGWEN-protected configuration registers.
+  // Wait for the entropy_src state machine to become idle and verify that
+  // REGWEN is asserted before writing REGWEN-protected configuration registers.
   uint32_t timeout = kEntropyPollReadyTimeout;
   while (
       !bitfield_bit32_read(abs_mmio_read32(entropy_src_base() +
@@ -788,6 +793,8 @@ static void entropy_src_stop(void) {
                            ENTROPY_SRC_DEBUG_STATUS_MAIN_SM_IDLE_BIT) &&
       --timeout > 0) {
   }
+  HARDENED_CHECK_EQ(
+      abs_mmio_read32(entropy_src_base() + ENTROPY_SRC_REGWEN_REG_OFFSET), 1);
 
   // Set default values for other critical registers to avoid synchronization
   // issues.
@@ -828,7 +835,9 @@ void entropy_complex_stop_all(void) {
   abs_mmio_write32(csrng_base() + CSRNG_CTRL_REG_OFFSET, CSRNG_CTRL_REG_RESVAL);
   // Read back CSRNG state to synchronize the disable write on the bus and
   // ensure any in-flight block encryption drains while CSRNG is disabled.
-  OT_DISCARD(abs_mmio_read32(csrng_base() + CSRNG_MAIN_SM_STATE_REG_OFFSET));
+  HARDENED_CHECK_EQ(
+      abs_mmio_read32(csrng_base() + CSRNG_MAIN_SM_STATE_REG_OFFSET),
+      kCsrngMainSmStateIdle);
   entropy_src_stop();
 
   if (status_ok(res)) {
