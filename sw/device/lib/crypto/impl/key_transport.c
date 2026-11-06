@@ -273,6 +273,7 @@ static status_t aes_kwp_key_construct(const otcrypto_blinded_key_t *key_kek,
   aes_key->keymgr_dpe_slot_idx = key_kek->config.keymgr_dpe_slot_idx;
 
   if (key_kek->config.hw_backed == kHardenedBoolTrue) {
+    OTCRYPTO_CMVP_OVERRIDE_NOT_APPROVED();
     // Call keymgr dpe to sideload the key into AES.
     keymgr_dpe_diversification_t diversification;
     HARDENED_TRY(
@@ -302,8 +303,8 @@ static status_t aes_kwp_key_construct(const otcrypto_blinded_key_t *key_kek,
  */
 OT_USED static void hw_wipe_guard(uint32_t *dummy) {
   (void)dummy;
-  (void)aes_clear();
-  (void)keymgr_dpe_sideload_clear_aes();
+  OT_DISCARD(aes_clear().value);
+  OT_DISCARD(keymgr_dpe_sideload_clear_aes().value);
 }
 
 otcrypto_status_t otcrypto_key_wrap(const otcrypto_blinded_key_t *key_to_wrap,
