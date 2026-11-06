@@ -69,6 +69,9 @@ module csrng_core import csrng_pkg::*; #(
   logic                        fips_force_enable;
   logic                        fips_force_enable_pfe;
   logic                        fips_force_enable_pfa;
+  logic                        int_state_halt;
+  logic                        int_state_halt_pfe;
+  logic                        int_state_halt_pfa;
   logic                        recov_alert_event;
   logic                        acmd_avail;
   logic                        acmd_sop;
@@ -118,6 +121,7 @@ module csrng_core import csrng_pkg::*; #(
   logic                        ctr_drbg_sm_err_sum;
   logic                        ctr_drbg_sm_err;
   logic                        ctr_drbg_v_ctr_err;
+  logic                        state_db_reg_ptr_err;
   logic                        block_encrypt_sm_err_sum;
   logic                        block_encrypt_sm_err;
 
@@ -136,6 +140,7 @@ module csrng_core import csrng_pkg::*; #(
   logic [NumApps-1:0]          cmd_stage_sfifo_cmd_err_wr;
   logic [NumApps-1:0]          cmd_stage_sfifo_cmd_err_rd;
   logic [NumApps-1:0]          cmd_stage_sfifo_cmd_err_st;
+  logic [NumApps-1:0]          cmd_stage_word_dropped;
   logic [2:0]                  cmd_stage_sfifo_genbits_err[NumApps];
   logic [NumApps-1:0]          cmd_stage_sfifo_genbits_err_sum;
   logic [NumApps-1:0]          cmd_stage_sfifo_genbits_err_wr;
@@ -169,7 +174,7 @@ module csrng_core import csrng_pkg::*; #(
   logic                        genbits_stage_bus_rd_sw;
   logic [31:0]                 genbits_stage_bus_sw;
 
-  logic [15:0]                 hw_exception_sts;
+  logic [NumHwApps-1:0]        hw_exception_sts;
   logic [LcHwDebugCopies-1:0]  lc_hw_debug_on_fo;
   logic                        state_db_reg_read_en;
 
@@ -193,6 +198,13 @@ module csrng_core import csrng_pkg::*; #(
 
   prim_mubi_pkg::mubi4_t [CsEnableCopies-1:0] mubi_cs_enable_fanout;
   prim_mubi_pkg::mubi4_t    [Flag0Copies-1:0] mubi_flag0_fanout;
+
+  // Internal-state halt signals
+  logic [NumAppsLg-1:0] int_state_num_idx;
+  logic                 int_state_num_vld;
+  logic [NumApps-1:0]   int_state_halted_pulse;
+  logic [NumApps-1:0]   cmd_stage_halt;
+  logic [NumApps-1:0]   cmd_stage_halted;
 
   // flops
   acmd_e                      acmd_q, acmd_d;
@@ -258,7 +270,7 @@ module csrng_core import csrng_pkg::*; #(
   ) u_intr_hw_cs_cmd_req_done (
     .clk_i                 (clk_i),
     .rst_ni                (rst_ni),
-    .event_intr_i          (cmd_stage_ack[NumApps-1]),
+    .event_intr_i          (cmd_stage_ack[NumApps-1] || |int_state_halted_pulse),
     .reg2hw_intr_enable_q_i(reg2hw.intr_enable.cs_cmd_req_done.q),
     .reg2hw_intr_test_q_i  (reg2hw.intr_test.cs_cmd_req_done.q),
     .reg2hw_intr_test_qe_i (reg2hw.intr_test.cs_cmd_req_done.qe),
@@ -313,6 +325,19 @@ module csrng_core import csrng_pkg::*; #(
     .intr_o                (intr_cs_fatal_err_o)
   );
 
+  prim_edge_detector #(
+    .Width(NumApps),
+    .ResetValue('0),
+    .EnSync(0)
+  ) u_prim_edge_detector_int_state_halted (
+    .clk_i,
+    .rst_ni,
+    .d_i(cmd_stage_halted),
+    .q_sync_o(),
+    .q_posedge_pulse_o(int_state_halted_pulse),
+    .q_negedge_pulse_o()
+  );
+
   // Counter and FSM errors are structural errors and are always active regardless of the
   // functional state. main_sm_err_sum is not included here to prevent some tools from
   // inferring combo loops. However, to include the state machine error for testing,
@@ -334,7 +359,7 @@ module csrng_core import csrng_pkg::*; #(
   assign block_encrypt_sm_err_sum = block_encrypt_sm_err || err_code_test_bit[25];
 
   // Collective error signals for each type of error
-  assign ctr_err_sum         = ctr_drbg_v_ctr_err || err_code_test_bit[26];
+  assign ctr_err_sum         = ctr_drbg_v_ctr_err || state_db_reg_ptr_err || err_code_test_bit[26];
   assign fifo_write_err_sum  = (|cmd_stage_sfifo_genbits_err_wr) || (|cmd_stage_sfifo_cmd_err_wr) ||
                                err_code_test_bit[28];
   assign fifo_read_err_sum   = (|cmd_stage_sfifo_genbits_err_rd) || (|cmd_stage_sfifo_cmd_err_rd) ||
@@ -404,6 +429,7 @@ module csrng_core import csrng_pkg::*; #(
          |invalid_gen_cmd_alert ||
          |gen_abort_invalid_alert ||
          |gen_abort_field_alert ||
+         int_state_halt_pfa ||
          cs_bus_cmp_alert;
 
 
@@ -501,10 +527,50 @@ module csrng_core import csrng_pkg::*; #(
     .mubi_o(mubi_fips_force_enable_fanout)
   );
 
+  // SEC_CM: CONFIG.MUBI
+  mubi4_t mubi_int_state_halt;
+  mubi4_t [1:0] mubi_int_state_halt_fanout;
+  assign mubi_int_state_halt = mubi4_t'(reg2hw.int_state_halt.q);
+  assign int_state_halt_pfe = mubi4_test_true_strict(mubi_int_state_halt_fanout[0]);
+  assign int_state_halt_pfa = mubi4_test_invalid(mubi_int_state_halt_fanout[1]);
+  assign hw2reg.recov_alert_sts.int_state_halt_field_alert.de = int_state_halt_pfa;
+  assign hw2reg.recov_alert_sts.int_state_halt_field_alert.d  = int_state_halt_pfa;
+
+  prim_mubi4_sync #(
+    .NumCopies(2),
+    .AsyncOn(0)
+  ) u_prim_mubi4_sync_int_state_halt (
+    .clk_i,
+    .rst_ni,
+    .mubi_i(mubi_int_state_halt),
+    .mubi_o(mubi_int_state_halt_fanout)
+  );
+
   // master module enable
   assign sw_app_enable = sw_app_enable_pfe;
   assign read_int_state = read_int_state_pfe;
   assign fips_force_enable = fips_force_enable_pfe;
+  assign int_state_halt = int_state_halt_pfe;
+
+  //------------------------------------------
+  // Internal-state halt control
+  //------------------------------------------
+  // This section of the RTL halts the instance selected via INT_STATE_NUM.
+
+  assign int_state_num_idx = reg2hw.int_state_num.q[NumAppsLg-1:0];
+  assign int_state_num_vld = reg2hw.int_state_num.q < NumApps;
+
+  // The selected instance is halted for as long as INT_STATE_HALT is set, provided that halting is
+  // enabled for it.
+  for (genvar ai = 0; ai < NumApps; ai = ai+1) begin : gen_cmd_stage_halt
+    assign cmd_stage_halt[ai] = cs_enable_fo[5] && int_state_halt &&
+                                (reg2hw.int_state_num.q == ai) &&
+                                reg2hw.int_state_halt_enable.q[ai];
+  end : gen_cmd_stage_halt
+
+  // Report the halted status of the selected instance.
+  assign hw2reg.int_state_sts.de = 1'b1;
+  assign hw2reg.int_state_sts.d  = int_state_num_vld && cmd_stage_halted[int_state_num_idx];
 
   //------------------------------------------
   // application interface
@@ -558,6 +624,8 @@ module csrng_core import csrng_pkg::*; #(
       .invalid_gen_cmd_alert_o      (invalid_gen_cmd_alert[ai]),
       .gen_abort_req_i              (gen_abort_req[ai]),
       .gen_abort_invalid_o          (gen_abort_invalid_alert[ai]),
+      .halt_i                       (cmd_stage_halt[ai]),
+      .halted_o                     (cmd_stage_halted[ai]),
       .cmd_arb_req_o                (cmd_arb_req[ai]),
       .cmd_arb_sop_o                (cmd_arb_sop[ai]),
       .cmd_arb_mop_o                (cmd_arb_mop[ai]),
@@ -597,14 +665,16 @@ module csrng_core import csrng_pkg::*; #(
   assign cmd_stage_bus[NumApps-1]  = reg2hw.cmd_req.q;
   assign cmd_stage_shid[NumApps-1] = InstIdWidth'(NumApps-1);
 
+  // The SW interface doesn't wait for a handshake, a word written while not ready is dropped.
+  assign cmd_stage_word_dropped[NumApps-1] = cmd_stage_vld[NumApps-1] && !cmd_stage_rdy[NumApps-1];
+
   assign hw2reg.sw_cmd_sts.cmd_rdy.de = 1'b1;
   assign hw2reg.sw_cmd_sts.cmd_rdy.d  = !cmd_stage_vld[NumApps-1] && sw_rdy_sts_q;
 
   assign sw_rdy_sts_d =
          !cs_enable_fo[28] ? 1'b0 :
          cmd_stage_vld[NumApps-1] ? 1'b0 :
-         cmd_stage_rdy[NumApps-1] ? 1'b1 :
-         sw_rdy_sts_q;
+         cmd_stage_rdy[NumApps-1];
 
   // cmd sts ack
   assign hw2reg.sw_cmd_sts.cmd_ack.de = 1'b1;
@@ -699,6 +769,7 @@ module csrng_core import csrng_pkg::*; #(
   for (genvar hai = 0; hai < (NumApps-1); hai = hai+1) begin : gen_app_if
     // cmd req
     assign cmd_stage_vld[hai]  = csrng_cmd_i[hai].csrng_req_valid;
+    assign cmd_stage_word_dropped[hai] = 1'b0;
     assign cmd_stage_shid[hai] = hai;
     assign cmd_stage_bus[hai]  = csrng_cmd_i[hai].csrng_req_bus;
     assign csrng_cmd_o[hai].csrng_req_ready = cmd_stage_rdy[hai];
@@ -710,22 +781,18 @@ module csrng_core import csrng_pkg::*; #(
     assign csrng_cmd_o[hai].genbits_fips  = genbits_stage_fips[hai];
     assign csrng_cmd_o[hai].genbits_bus   = genbits_stage_bus[hai];
     assign genbits_stage_rdy[hai] = csrng_cmd_i[hai].genbits_ready;
+    // exception status
+    assign hw_exception_sts[hai] = cmd_stage_ack[hai] &&
+                                   (cmd_stage_ack_sts[hai] != CMD_STS_SUCCESS);
   end : gen_app_if
-
-  // Assign ack statuss
-  for (genvar i = 0; i < 16; i = i+1) begin : gen_app_if_sts
-    if (i < NumApps) begin : gen_assign
-      assign hw_exception_sts[i] = cmd_stage_ack[i] && (cmd_stage_ack_sts[i] != CMD_STS_SUCCESS);
-    end else begin : gen_dummy_assign
-      assign hw_exception_sts[i] = 1'b0;
-    end
-  end : gen_app_if_sts
 
   // set fifo err status bits
   for (genvar i = 0; i < NumApps; i = i+1) begin : gen_fifo_sts
     assign cmd_stage_sfifo_cmd_err_sum[i] = (|cmd_stage_sfifo_cmd_err[i] ||
+                                             cmd_stage_word_dropped[i] ||
                                              err_code_test_bit[0]);
-    assign cmd_stage_sfifo_cmd_err_wr[i] = cmd_stage_sfifo_cmd_err[i][2];
+    assign cmd_stage_sfifo_cmd_err_wr[i] = cmd_stage_sfifo_cmd_err[i][2] ||
+                                           cmd_stage_word_dropped[i];
     assign cmd_stage_sfifo_cmd_err_rd[i] = cmd_stage_sfifo_cmd_err[i][1];
     assign cmd_stage_sfifo_cmd_err_st[i] = cmd_stage_sfifo_cmd_err[i][0];
     assign cmd_stage_sfifo_genbits_err_sum[i] = (|cmd_stage_sfifo_genbits_err[i] ||
@@ -907,7 +974,9 @@ module csrng_core import csrng_pkg::*; #(
     .reseed_counter_o(reseed_counter),
     .inst_state_o    (state_db_inst_state),
     .gen_cnt_o       (state_db_gen_cnt),
-    .gen_flag_o      (state_db_gen_flag)
+    .gen_flag_o      (state_db_gen_flag),
+
+    .reg_ptr_err_o(state_db_reg_ptr_err)
   );
 
   // Forward the reseed counter values to the register interface.
@@ -1056,7 +1125,7 @@ module csrng_core import csrng_pkg::*; #(
   // Misc status
 
   assign hw2reg.hw_exc_sts.de = cs_enable_fo[50];
-  assign hw2reg.hw_exc_sts.d  = hw_exception_sts;
+  assign hw2reg.hw_exc_sts.d  = MaxNumInstances'(hw_exception_sts);
 
   // unused signals
   logic               unused_err_code_test_bit;
@@ -1070,7 +1139,7 @@ module csrng_core import csrng_pkg::*; #(
 
   assign unused_err_code_test_bit = err_code_test_bit[27] || (|err_code_test_bit[24:23]) ||
                                     (|err_code_test_bit[19:2]);
-  assign unused_enable_fo = |cs_enable_fo[18:5] || (|cs_enable_fo[35:33]) ||
+  assign unused_enable_fo = |cs_enable_fo[18:6] || (|cs_enable_fo[35:33]) ||
                             (|cs_enable_fo[47:46]);
   assign unused_reg2hw_genbits = (|reg2hw.genbits.q);
   assign unused_int_state_val = (|reg2hw.int_state_val.q);
